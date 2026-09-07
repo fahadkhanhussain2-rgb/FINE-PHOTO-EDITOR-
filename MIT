@@ -1,1 +1,18 @@
 
+---
+
+### **File 2: `app/src/main/res/values/strings.xml`** (Updated)
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fine Photo Editor</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="gallery">Gallery</string>
+    <string name="camera">Camera</string>
+    <string name="recent">Recent</string>
+    <string name="settings">Settings</string>
+    <string name="export">Export</string>
+    <string name="quality">Quality</string>
+</resources>
