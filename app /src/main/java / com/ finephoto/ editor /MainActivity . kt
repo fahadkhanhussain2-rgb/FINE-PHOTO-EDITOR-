@@ -1,1 +1,781 @@
+package com.finephoto.editor
 
+import android.Manifest
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.MediaStore
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.finephoto.editor.engine.ImageProcessor
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.io.File
+import java.io.FileOutputStream
+
+@OptIn(ExperimentalMaterial3Api::class)
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(),
+                typography = Typography(
+                    bodyLarge = MaterialTheme.typography.bodyLarge.copy(
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Default
+                    )
+                )
+            ) {
+                FinePhotoEditorApp()
+            }
+        }
+    }
+}
+
+@Composable
+fun FinePhotoEditorApp() {
+    val viewModel: MainViewModel = viewModel()
+    val state by viewModel.uiState.collectAsState()
+    
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = Color(0xFF121212)
+    ) {
+        when (state.currentScreen) {
+            Screen.Home -> HomeScreen(viewModel, state)
+            Screen.Editor -> EditorScreen(viewModel, state)
+        }
+    }
+}
+
+data class UIState(
+    val currentScreen: Screen = Screen.Home,
+    val selectedImage: Bitmap? = null,
+    val processedImage: Bitmap? = null,
+    val adjustmentState: ImageProcessor.AdjustmentState = ImageProcessor.AdjustmentState(),
+    val isProcessing: Boolean = false,
+    val selectedCategory: String = "Basic",
+    val selectedPreset: String? = null,
+    val history: List<ImageProcessor.AdjustmentState> = emptyList(),
+    val historyIndex: Int = -1,
+    val zoomScale: Float = 1f,
+    val panOffset: Offset = Offset.Zero,
+    val exportQuality: Int = 90,
+    val showBeforeAfter: Boolean = false
+)
+
+enum class Screen { Home, Editor }
+
+class MainViewModel : androidx.lifecycle.ViewModel() {
+    private val _uiState = MutableStateFlow(UIState())
+    val uiState: StateFlow<UIState> = _uiState.asStateFlow()
+    
+    private val imageProcessor = ImageProcessor()
+    private var originalBitmap: Bitmap? = null
+    private var processingJob: Job? = null
+    private val debounceTime = 150L
+    
+    fun loadImage(bitmap: Bitmap) {
+        originalBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        _uiState.update { 
+            it.copy(
+                selectedImage = bitmap,
+                currentScreen = Screen.Editor,
+                adjustmentState = ImageProcessor.AdjustmentState(),
+                processedImage = bitmap,
+                history = listOf(ImageProcessor.AdjustmentState()),
+                historyIndex = 0
+            )
+        }
+        processImage()
+    }
+    
+    fun updateAdjustment(block: ImageProcessor.AdjustmentState.() -> Unit) {
+        val newState = _uiState.value.adjustmentState.apply(block)
+        _uiState.update { it.copy(adjustmentState = newState) }
+        
+        val history = _uiState.value.history
+        val lastState = if (history.isNotEmpty()) history.last() else null
+        
+        if (lastState != newState) {
+            val newHistory = history.take(_uiState.value.historyIndex + 1) + newState
+            _uiState.update { 
+                it.copy(
+                    history = newHistory,
+                    historyIndex = newHistory.size - 1
+                )
+            }
+        }
+        processImage()
+    }
+    
+    fun undo() {
+        val history = _uiState.value.history
+        val index = _uiState.value.historyIndex
+        if (index > 0) {
+            _uiState.update { 
+                it.copy(
+                    historyIndex = index - 1,
+                    adjustmentState = history[index - 1]
+                )
+            }
+            processImage()
+        }
+    }
+    
+    fun redo() {
+        val history = _uiState.value.history
+        val index = _uiState.value.historyIndex
+        if (index < history.size - 1) {
+            _uiState.update { 
+                it.copy(
+                    historyIndex = index + 1,
+                    adjustmentState = history[index + 1]
+                )
+            }
+            processImage()
+        }
+    }
+    
+    fun reset() {
+        _uiState.update { 
+            it.copy(
+                adjustmentState = ImageProcessor.AdjustmentState(),
+                history = listOf(ImageProcessor.AdjustmentState()),
+                historyIndex = 0
+            )
+        }
+        processImage()
+    }
+    
+    suspend fun autoEnhance() {
+        val bitmap = originalBitmap ?: return
+        val autoState = imageProcessor.autoEnhance(bitmap)
+        _uiState.update { it.copy(adjustmentState = autoState) }
+        processImage()
+    }
+    
+    private fun processImage() {
+        processingJob?.cancel()
+        processingJob = CoroutineScope(Dispatchers.IO).launch {
+            val bitmap = originalBitmap ?: return@launch
+            val state = _uiState.value.adjustmentState
+            
+            _uiState.update { it.copy(isProcessing = true) }
+            delay(debounceTime)
+            val processed = imageProcessor.processImage(bitmap, state)
+            
+            withContext(Dispatchers.Main) {
+                _uiState.update { 
+                    it.copy(
+                        processedImage = processed,
+                        isProcessing = false
+                    )
+                }
+            }
+        }
+    }
+    
+    fun applyPreset(preset: Preset) {
+        val newState = preset.applyTo(ImageProcessor.AdjustmentState())
+        _uiState.update { 
+            it.copy(
+                adjustmentState = newState,
+                selectedPreset = preset.name
+            )
+        }
+        processImage()
+    }
+    
+    fun updateZoomScale(scale: Float) {
+        _uiState.update { it.copy(zoomScale = scale.coerceIn(0.5f, 3f)) }
+    }
+    
+    fun updatePanOffset(offset: Offset) {
+        _uiState.update { it.copy(panOffset = offset) }
+    }
+    
+    fun toggleBeforeAfter() {
+        _uiState.update { it.copy(showBeforeAfter = !it.showBeforeAfter) }
+    }
+}
+
+data class Preset(
+    val name: String,
+    val category: String,
+    val icon: String,
+    val applyTo: (ImageProcessor.AdjustmentState) -> ImageProcessor.AdjustmentState
+)
+
+object Presets {
+    val all = listOf(
+        Preset("Cinematic Blue", "Cinematic", "🎬") { state ->
+            state.apply {
+                contrast = 0.3f; temperature = -0.2f; tint = 0.1f
+                saturation = 0.2f; vibrance = 0.1f; highlights = -0.1f
+                shadows = 0.2f; fade = 0.05f
+            }
+            state
+        },
+        Preset("Cinematic Gold", "Cinematic", "🎬") { state ->
+            state.apply {
+                contrast = 0.2f; temperature = 0.3f; tint = 0.1f
+                saturation = 0.1f; vibrance = 0.2f; highlights = -0.1f
+                shadows = 0.1f; dehaze = 0.1f
+            }
+            state
+        },
+        Preset("Kodak Portra", "Film", "🎞️") { state ->
+            state.apply {
+                contrast = -0.1f; saturation = -0.2f; vibrance = -0.1f
+                temperature = 0.1f; fade = 0.2f; grain = 0.15f
+                shadows = 0.3f; highlights = -0.2f
+            }
+            state
+        },
+        Preset("Fuji Pro", "Film", "🎞️") { state ->
+            state.apply {
+                contrast = 0.1f; saturation = 0.3f; vibrance = 0.2f
+                temperature = -0.1f; tint = 0.1f; clarity = 0.2f; grain = 0.1f
+            }
+            state
+        },
+        Preset("Soft Glow", "Portrait", "👤") { state ->
+            state.apply {
+                contrast = -0.2f; saturation = -0.1f; vibrance = 0.2f
+                temperature = 0.1f; clarity = -0.3f; texture = 0.2f
+                highlights = 0.3f; shadows = 0.3f
+            }
+            state
+        },
+        Preset("Studio", "Portrait", "👤") { state ->
+            state.apply {
+                contrast = 0.1f; saturation = 0.1f; vibrance = 0.3f
+                clarity = 0.2f; texture = 0.3f; dehaze = 0.2f; sharpen = 0.2f
+            }
+            state
+        },
+        Preset("Tropical", "Travel", "✈️") { state ->
+            state.apply {
+                temperature = 0.2f; saturation = 0.4f; vibrance = 0.3f
+                contrast = 0.1f; clarity = 0.2f; highlights = -0.1f; shadows = 0.2f
+            }
+            state
+        },
+        Preset("Desert", "Travel", "✈️") { state ->
+            state.apply {
+                temperature = 0.4f; saturation = -0.1f; vibrance = 0.2f
+                contrast = 0.3f; tint = -0.1f; whites = 0.2f; blacks = -0.2f
+            }
+            state
+        },
+        Preset("Dark Mood", "Moody", "🌙") { state ->
+            state.apply {
+                contrast = 0.4f; saturation = -0.2f; vibrance = -0.1f
+                temperature = -0.2f; exposure = -0.1f; highlights = -0.3f
+                shadows = 0.4f; blacks = -0.2f; vignette = 0.5f
+            }
+            state
+        },
+        Preset("Noir", "Moody", "🌙") { state ->
+            state.apply {
+                contrast = 0.6f; saturation = -0.8f; vibrance = -0.5f
+                temperature = 0.1f; exposure = -0.1f; highlights = -0.4f
+                shadows = 0.6f; blacks = -0.3f; grain = 0.2f; vignette = 0.6f
+            }
+            state
+        },
+        Preset("Retro", "Vintage", "📻") { state ->
+            state.apply {
+                temperature = 0.3f; saturation = -0.3f; vibrance = -0.2f
+                contrast = 0.1f; fade = 0.3f; grain = 0.2f; vignette = 0.3f; shadows = 0.2f
+            }
+            state
+        },
+        Preset("Sepia", "Vintage", "📻") { state ->
+            state.apply {
+                temperature = 0.5f; saturation = -0.6f; vibrance = -0.4f
+                contrast = 0.2f; fade = 0.2f; grain = 0.1f; tint = 0.2f
+            }
+            state
+        },
+        Preset("Urban", "Street", "🏙️") { state ->
+            state.apply {
+                contrast = 0.5f; saturation = 0.2f; vibrance = 0.1f
+                temperature = -0.1f; clarity = 0.4f; texture = 0.3f
+                dehaze = 0.2f; sharpen = 0.3f; highlights = -0.2f; shadows = 0.3f
+            }
+            state
+        },
+        Preset("Cyberpunk", "Street", "🏙️") { state ->
+            state.apply {
+                contrast = 0.4f; saturation = 0.5f; vibrance = 0.3f
+                temperature = -0.3f; tint = 0.2f; clarity = 0.3f
+                highlights = -0.2f; shadows = 0.3f; dehaze = 0.2f
+            }
+            state
+        },
+        Preset("Vibrant", "Social", "📱") { state ->
+            state.apply {
+                saturation = 0.5f; vibrance = 0.4f; contrast = 0.2f
+                clarity = 0.3f; temperature = 0.1f; sharpen = 0.2f
+                highlights = -0.1f; shadows = 0.2f
+            }
+            state
+        },
+        Preset("Pastel", "Social", "📱") { state ->
+            state.apply {
+                saturation = -0.2f; vibrance = -0.1f; contrast = -0.3f
+                temperature = 0.2f; fade = 0.3f; clarity = -0.2f
+                highlights = 0.4f; shadows = 0.5f
+            }
+            state
+        }
+    )
+    val categories = all.groupBy { it.category }.keys.toList()
+}
+
+@Composable
+fun HomeScreen(viewModel: MainViewModel, state: UIState) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        result.data?.data?.let { uri ->
+            scope.launch {
+                val bitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream)
+                }
+                bitmap?.let { viewModel.loadImage(it) }
+            }
+        }
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121212))
+            .padding(16.dp)
+    ) {
+        // App Title
+        Text(
+            "FINE PHOTO",
+            style = MaterialTheme.typography.headlineLarge.copy(
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF007AFF),
+                fontSize = 32.sp,
+                letterSpacing = 2.sp
+            )
+        )
+        Text(
+            "EDITOR",
+            style = MaterialTheme.typography.headlineLarge.copy(
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                fontSize = 32.sp,
+                letterSpacing = 2.sp
+            ),
+            modifier = Modifier.padding(bottom = 32.dp)
+        )
+        
+        // Import Card
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(200.dp)
+                .clickable {
+                    val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+                    galleryLauncher.launch(intent)
+                },
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Default.PhotoLibrary,
+                    contentDescription = "Import Photo",
+                    tint = Color(0xFF007AFF),
+                    modifier = Modifier.size(64.dp)
+                )
+                Text(
+                    "Tap to Import Photo",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    modifier = Modifier.padding(top = 16.dp)
+                )
+                Text(
+                    "From Gallery",
+                    color = Color.Gray,
+                    fontSize = 14.sp
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(24.dp))
+        
+        // Features List
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Text(
+                    "✨ Features",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                listOf(
+                    "🎨 16 Professional Presets",
+                    "🌈 8-Channel HSL Control",
+                    "🤖 AI Auto-Enhance",
+                    "📸 Export Full Resolution"
+                ).forEach { feature ->
+                    Text(
+                        feature,
+                        color = Color.Gray,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun EditorScreen(viewModel: MainViewModel, state: UIState) {
+    var selectedTool by remember { mutableStateOf("Basic") }
+    var showSaveDialog by remember { mutableStateOf(false) }
+    var exportQuality by remember { mutableStateOf(90) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121212))
+    ) {
+        // Top Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { viewModel.loadImage(state.selectedImage ?: return@IconButton) }) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+                }
+                Text(
+                    "Fine Editor",
+                    color = Color(0xFF007AFF),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp
+                )
+            }
+            
+            Row {
+                IconButton(onClick = { viewModel.undo() }, enabled = state.historyIndex > 0) {
+                    Icon(Icons.Default.Undo, contentDescription = "Undo", tint = Color.White)
+                }
+                IconButton(onClick = { viewModel.redo() }, enabled = state.historyIndex < state.history.size - 1) {
+                    Icon(Icons.Default.Redo, contentDescription = "Redo", tint = Color.White)
+                }
+                IconButton(onClick = { viewModel.reset() }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Reset", tint = Color.White)
+                }
+                IconButton(onClick = { scope.launch { viewModel.autoEnhance() } }) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = "Auto", tint = Color(0xFFFFD700))
+                }
+                IconButton(onClick = { showSaveDialog = true }) {
+                    Icon(Icons.Default.Save, contentDescription = "Save", tint = Color(0xFF007AFF))
+                }
+            }
+        }
+        
+        // Image Display
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(Color.Black)
+        ) {
+            if (state.processedImage != null) {
+                Image(
+                    bitmap = state.processedImage!!.asImageBitmap(),
+                    contentDescription = "Edited Image",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit
+                )
+            }
+            
+            if (state.isProcessing) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.3f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = Color.White)
+                }
+            }
+        }
+        
+        // Tool Categories
+        ScrollableTabRow(
+            selectedTabIndex = when (selectedTool) {
+                "Basic" -> 0; "Color" -> 1; "HSL" -> 2
+                "Effects" -> 3; "Presets" -> 4; "Tools" -> 5
+                else -> 0
+            },
+            containerColor = Color(0xFF1E1E1E),
+            edgePadding = 8.dp,
+            divider = {},
+            indicator = { tabPositions ->
+                TabRowDefaults.SecondaryIndicator(
+                    modifier = Modifier.tabIndicatorOffset(tabPositions[when (selectedTool) {
+                        "Basic" -> 0; "Color" -> 1; "HSL" -> 2
+                        "Effects" -> 3; "Presets" -> 4; "Tools" -> 5
+                        else -> 0
+                    }]),
+                    height = 2.dp,
+                    color = Color(0xFF007AFF)
+                )
+            }
+        ) {
+            listOf("Basic", "Color", "HSL", "Effects", "Presets", "Tools").forEach { tool ->
+                Tab(
+                    selected = selectedTool == tool,
+                    onClick = { selectedTool = tool },
+                    text = {
+                        Text(
+                            tool,
+                            color = if (selectedTool == tool) Color.White else Color.Gray,
+                            fontSize = 12.sp
+                        )
+                    }
+                )
+            }
+        }
+        
+        // Tool Content
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(200.dp),
+            color = Color(0xFF1E1E1E)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                when (selectedTool) {
+                    "Basic" -> {
+                        listOf("Exposure", "Contrast", "Highlights", "Shadows", "Whites", "Blacks").forEachIndexed { index, label ->
+                            val value = when (index) {
+                                0 -> state.adjustmentState.exposure
+                                1 -> state.adjustmentState.contrast
+                                2 -> state.adjustmentState.highlights
+                                3 -> state.adjustmentState.shadows
+                                4 -> state.adjustmentState.whites
+                                else -> state.adjustmentState.blacks
+                            }
+                            AdjustmentSlider(
+                                label = label,
+                                value = value,
+                                range = -1f..1f,
+                                onValueChange = { 
+                                    when (index) {
+                                        0 -> viewModel.updateAdjustment { exposure = it }
+                                        1 -> viewModel.updateAdjustment { contrast = it }
+                                        2 -> viewModel.updateAdjustment { highlights = it }
+                                        3 -> viewModel.updateAdjustment { shadows = it }
+                                        4 -> viewModel.updateAdjustment { whites = it }
+                                        else -> viewModel.updateAdjustment { blacks = it }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    "Color" -> {
+                        listOf("Temperature", "Tint", "Saturation", "Vibrance").forEachIndexed { index, label ->
+                            val value = when (index) {
+                                0 -> state.adjustmentState.temperature
+                                1 -> state.adjustmentState.tint
+                                2 -> state.adjustmentState.saturation
+                                else -> state.adjustmentState.vibrance
+                            }
+                            AdjustmentSlider(
+                                label = label,
+                                value = value,
+                                range = -1f..1f,
+                                onValueChange = {
+                                    when (index) {
+                                        0 -> viewModel.updateAdjustment { temperature = it }
+                                        1 -> viewModel.updateAdjustment { tint = it }
+                                        2 -> viewModel.updateAdjustment { saturation = it }
+                                        else -> viewModel.updateAdjustment { vibrance = it }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    "Effects" -> {
+                        listOf("Clarity", "Texture", "Dehaze", "Sharpen", "Grain", "Vignette", "Fade").forEachIndexed { index, label ->
+                            val value = when (index) {
+                                0 -> state.adjustmentState.clarity
+                                1 -> state.adjustmentState.texture
+                                2 -> state.adjustmentState.dehaze
+                                3 -> state.adjustmentState.sharpen
+                                4 -> state.adjustmentState.grain
+                                5 -> state.adjustmentState.vignette
+                                else -> state.adjustmentState.fade
+                            }
+                            AdjustmentSlider(
+                                label = label,
+                                value = value,
+                                range = 0f..1f,
+                                onValueChange = {
+                                    when (index) {
+                                        0 -> viewModel.updateAdjustment { clarity = it }
+                                        1 -> viewModel.updateAdjustment { texture = it }
+                                        2 -> viewModel.updateAdjustment { dehaze = it }
+                                        3 -> viewModel.updateAdjustment { sharpen = it }
+                                        4 -> viewModel.updateAdjustment { grain = it }
+                                        5 -> viewModel.updateAdjustment { vignette = it }
+                                        else -> viewModel.updateAdjustment { fade = it }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    "HSL" -> {
+                        Text(
+                            "HSL Channels",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        Text(
+                            "8-Channel Soft-Weighted HSL",
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        listOf("Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta").forEach { channel ->
+                            Text(
+                                "• $channel",
+                                color = Color(0xFF007AFF),
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(vertical = 2.dp)
+                            )
+                        }
+                        Text(
+                            "Adjust HSL in full editor",
+                            color = Color.Gray,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                    "Presets" -> {
+                        val categories = Presets.categories
+                        val selectedCategory = remember { mutableStateOf(categories.firstOrNull() ?: "") }
+                        
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        ) {
+                            items(categories) { category ->
+                                FilterChip(
+                                    selected = selectedCategory.value == category,
+                                    onClick = { selectedCategory.value = category },
+                                    label = { Text(category, fontSize = 12.sp) },
+                                    modifier = Modifier.height(32.dp),
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF007AFF),
+                                        selectedLabelColor = Color.White,
+                                        labelColor = Color.Gray
+                                    )
+                                )
+                            }
+                        }
+                        
+                        val presets = Presets.all.filter { it.category == selectedCategory.value }
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            items(presets) { preset ->
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier
+                                        .width(70.dp)
+                                        .clickable { viewModel.applyPreset(preset) }
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(50.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(
+                                                if (state.selectedPreset == preset.name) 
+                                                    Color(0xFF007AFF) 
+                                                else 
+                                                    Color(0xFF2A2A2A)
+                                            )
+                                            .border(
+                                                width = if (state.selectedPreset == preset.name) 2.dp else 0.dp,
+                                                color = Color(0xFF007AFF),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(preset.icon, fontSize = 20.sp)
+                                    }
+                                    Text(
+                                        preset.name,
+                                        color = if (state.selectedPreset == preset.name) Color.White else Color.Gray,
