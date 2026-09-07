@@ -779,3 +779,157 @@ fun EditorScreen(viewModel: MainViewModel, state: UIState) {
                                     Text(
                                         preset.name,
                                         color = if (state.selectedPreset == preset.name) Color.White else Color.Gray,
+                                        fontSize = 10.sp,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    "Tools" -> {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf("Crop", "Rotate", "Flip H", "Flip V").forEach { tool ->
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable {
+                                            when (tool) {
+                                                "Rotate" -> viewModel.updateAdjustment { rotation = ((rotation + 90) % 360) }
+                                                "Flip H" -> viewModel.updateAdjustment { flipHorizontal = !flipHorizontal }
+                                                "Flip V" -> viewModel.updateAdjustment { flipVertical = !flipVertical }
+                                            }
+                                        }
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(Color(0xFF2A2A2A)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            when (tool) {
+                                                "Crop" -> Icons.Default.Crop
+                                                "Rotate" -> Icons.Default.RotateRight
+                                                else -> Icons.Default.Flip
+                                            },
+                                            contentDescription = tool,
+                                            tint = Color.White
+                                        )
+                                    }
+                                    Text(tool, color = Color.Gray, fontSize = 10.sp)
+                                }
+                            }
+                        }
+                        AdjustmentSlider(
+                            label = "Straighten",
+                            value = state.adjustmentState.straighten,
+                            range = -45f..45f,
+                            onValueChange = { viewModel.updateAdjustment { straighten = it } }
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    // Save Dialog
+    if (showSaveDialog) {
+        AlertDialog(
+            onDismissRequest = { showSaveDialog = false },
+            title = { Text("Export Image", color = Color.White) },
+            text = {
+                Column {
+                    Text("JPEG Quality", color = Color.White)
+                    Slider(
+                        value = exportQuality.toFloat(),
+                        onValueChange = { exportQuality = it.toInt() },
+                        valueRange = 50f..100f,
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color(0xFF007AFF),
+                            activeTrackColor = Color(0xFF007AFF)
+                        )
+                    )
+                    Text("$exportQuality%", color = Color.Gray, modifier = Modifier.align(Alignment.End))
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showSaveDialog = false
+                        scope.launch {
+                            state.processedImage?.let { bitmap ->
+                                saveImageToGallery(context, bitmap, exportQuality)
+                                Toast.makeText(context, "Image saved successfully!", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                ) {
+                    Text("Save", color = Color(0xFF007AFF))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSaveDialog = false }) {
+                    Text("Cancel", color = Color.Gray)
+                }
+            },
+            containerColor = Color(0xFF2A2A2A)
+        )
+    }
+}
+
+@Composable
+fun AdjustmentSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(label, color = Color.White, fontSize = 13.sp)
+            Text(String.format("%.1f", value), color = Color.Gray, fontSize = 12.sp)
+        }
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = range,
+            colors = SliderDefaults.colors(
+                thumbColor = Color(0xFF007AFF),
+                activeTrackColor = Color(0xFF007AFF),
+                inactiveTrackColor = Color(0xFF2A2A2A)
+            ),
+            modifier = Modifier.height(16.dp)
+        )
+    }
+}
+
+suspend fun saveImageToGallery(context: android.content.Context, bitmap: Bitmap, quality: Int) {
+    withContext(Dispatchers.IO) {
+        val filename = "FinePhoto_${System.currentTimeMillis()}.jpg"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FinePhotoEditor")
+        }
+        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        uri?.let {
+            context.contentResolver.openOutputStream(it)?.use { stream ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
+            }
+        }
+    }
+}
+
+fun Bitmap.asImageBitmap(): ImageBitmap = this.asImageBitmap()
