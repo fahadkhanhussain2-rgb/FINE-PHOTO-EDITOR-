@@ -1,1 +1,14 @@
+package com.finephoto.editor.engine
 
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Matrix
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlin.math.*
+
+class ImageProcessor {
+    // ... (same content as before)
+    // Copy the entire ImageProcessor from previous response
+    // Just change package name to: com.finephoto.editor.engine
+}
