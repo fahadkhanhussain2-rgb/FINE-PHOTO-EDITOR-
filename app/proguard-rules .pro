@@ -1,1 +1,3 @@
-
+-keep class com.finephoto.editor.** { *; }
+-keep class androidx.compose.** { *; }
+-keep class kotlinx.coroutines.** { *; }
