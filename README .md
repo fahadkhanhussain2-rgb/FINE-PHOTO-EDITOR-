@@ -5,7 +5,7 @@
 - 🎨 Full image editing (Exposure, Contrast, Highlights, Shadows, etc.)
 - 🌈 8-Channel HSL adjustments
 - ✨ 16 Professional Presets
-- 🤖 Auto-Enhance AI
+- 🤖 AI Auto-Enhance
 - ↩️ Undo/Redo/Reset
 - 📱 Pinch-to-zoom & Pan
 - 👁️ Before/After comparison
