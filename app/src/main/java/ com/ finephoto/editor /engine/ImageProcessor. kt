@@ -8,7 +8,485 @@ import kotlinx.coroutines.withContext
 import kotlin.math.*
 
 class ImageProcessor {
-    // ... (same content as before)
-    // Copy the entire ImageProcessor from previous response
-    // Just change package name to: com.finephoto.editor.engine
+    
+    data class AdjustmentState(
+        var exposure: Float = 0f,
+        var contrast: Float = 0f,
+        var highlights: Float = 0f,
+        var shadows: Float = 0f,
+        var whites: Float = 0f,
+        var blacks: Float = 0f,
+        var temperature: Float = 0f,
+        var tint: Float = 0f,
+        var saturation: Float = 0f,
+        var vibrance: Float = 0f,
+        var clarity: Float = 0f,
+        var texture: Float = 0f,
+        var dehaze: Float = 0f,
+        var sharpen: Float = 0f,
+        var grain: Float = 0f,
+        var vignette: Float = 0f,
+        var fade: Float = 0f,
+        var cropLeft: Float = 0f,
+        var cropTop: Float = 0f,
+        var cropRight: Float = 1f,
+        var cropBottom: Float = 1f,
+        var rotation: Float = 0f,
+        var straighten: Float = 0f,
+        var flipHorizontal: Boolean = false,
+        var flipVertical: Boolean = false,
+        var hsl: HSLChannels = HSLChannels()
+    )
+    
+    data class HSLChannels(
+        var red: HSL = HSL(),
+        var orange: HSL = HSL(),
+        var yellow: HSL = HSL(),
+        var green: HSL = HSL(),
+        var aqua: HSL = HSL(),
+        var blue: HSL = HSL(),
+        var purple: HSL = HSL(),
+        var magenta: HSL = HSL()
+    )
+    
+    data class HSL(
+        var hue: Float = 0f,
+        var saturation: Float = 0f,
+        var luminance: Float = 0f
+    )
+    
+    suspend fun processImage(
+        originalBitmap: Bitmap,
+        state: AdjustmentState
+    ): Bitmap = withContext(Dispatchers.Default) {
+        var result = originalBitmap.copy(Bitmap.Config.ARGB_8888, true)
+        result = applyCropRotationFlip(result, state)
+        result = applyPixelAdjustments(result, state)
+        result = applyEffects(result, state)
+        result
+    }
+    
+    private fun applyCropRotationFlip(
+        bitmap: Bitmap,
+        state: AdjustmentState
+    ): Bitmap {
+        val matrix = Matrix()
+        if (state.rotation != 0f || state.straighten != 0f) {
+            matrix.postRotate(state.rotation + state.straighten)
+        }
+        var scaledX = 1f
+        var scaledY = 1f
+        if (state.flipHorizontal) scaledX = -1f
+        if (state.flipVertical) scaledY = -1f
+        if (scaledX != 1f || scaledY != 1f) {
+            matrix.postScale(scaledX, scaledY, bitmap.width / 2f, bitmap.height / 2f)
+        }
+        val cropW = (state.cropRight - state.cropLeft) * bitmap.width
+        val cropH = (state.cropBottom - state.cropTop) * bitmap.height
+        val cropX = state.cropLeft * bitmap.width
+        val cropY = state.cropTop * bitmap.height
+        
+        return if (cropW < bitmap.width || cropH < bitmap.height || 
+                   state.rotation != 0f || state.flipHorizontal || state.flipVertical) {
+            val cropped = Bitmap.createBitmap(
+                bitmap,
+                cropX.toInt(), cropY.toInt(),
+                cropW.toInt(), cropH.toInt(),
+                matrix, true
+            )
+            bitmap.recycle()
+            cropped
+        } else {
+            bitmap
+        }
+    }
+    
+    private fun applyPixelAdjustments(
+        bitmap: Bitmap,
+        state: AdjustmentState
+    ): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        
+        val exposureFactor = exp(state.exposure * 1.5f)
+        val contrastFactor = 1f + state.contrast * 0.5f
+        val tempFactor = state.temperature * 0.3f
+        val tintFactor = state.tint * 0.3f
+        val satFactor = 1f + state.saturation * 0.5f
+        val vibranceFactor = 1f + state.vibrance * 0.3f
+        
+        for (i in pixels.indices) {
+            var r = Color.red(pixels[i])
+            var g = Color.green(pixels[i])
+            var b = Color.blue(pixels[i])
+            
+            var rf = r / 255f
+            var gf = g / 255f
+            var bf = b / 255f
+            
+            rf *= exposureFactor
+            gf *= exposureFactor
+            bf *= exposureFactor
+            
+            rf = ((rf - 0.5f) * contrastFactor + 0.5f)
+            gf = ((gf - 0.5f) * contrastFactor + 0.5f)
+            bf = ((bf - 0.5f) * contrastFactor + 0.5f)
+            
+            rf += tempFactor
+            bf -= tempFactor
+            rf += tintFactor * 0.5f
+            bf -= tintFactor * 0.5f
+            
+            val hsl = rgbToHsl(rf, gf, bf)
+            val adjustedHsl = applyHSLChannels(hsl, state.hsl)
+            val rgb = hslToRgb(adjustedHsl)
+            rf = rgb.first
+            gf = rgb.second
+            bf = rgb.third
+            
+            val gray = 0.299f * rf + 0.587f * gf + 0.114f * bf
+            val satBoost = 1f + (1f - gray) * (vibranceFactor - 1f) * 0.5f
+            rf = gray + (rf - gray) * satFactor * satBoost
+            gf = gray + (gf - gray) * satFactor * satBoost
+            bf = gray + (bf - gray) * satFactor * satBoost
+            
+            val luminance = 0.299f * rf + 0.587f * gf + 0.114f * bf
+            val highlightBoost = 1f + state.highlights * (1f - luminance) * 0.5f
+            val shadowBoost = 1f + state.shadows * luminance * 0.5f
+            rf *= highlightBoost * shadowBoost
+            gf *= highlightBoost * shadowBoost
+            bf *= highlightBoost * shadowBoost
+            
+            val whiteBoost = 1f + state.whites * 0.3f
+            val blackBoost = 1f + state.blacks * 0.3f
+            rf = rf * whiteBoost + (1f - rf) * (1f - blackBoost)
+            gf = gf * whiteBoost + (1f - gf) * (1f - blackBoost)
+            bf = bf * whiteBoost + (1f - bf) * (1f - blackBoost)
+            
+            rf = rf.coerceIn(0f, 1f)
+            gf = gf.coerceIn(0f, 1f)
+            bf = bf.coerceIn(0f, 1f)
+            
+            pixels[i] = Color.rgb(
+                (rf * 255).toInt(),
+                (gf * 255).toInt(),
+                (bf * 255).toInt()
+            )
+        }
+        
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, width, 0, 0, width, height)
+        bitmap.recycle()
+        return result
+    }
+    
+    private fun applyHSLChannels(hsl: Triple<Float, Float, Float>, channels: HSLChannels): Triple<Float, Float, Float> {
+        var (h, s, l) = hsl
+        val hueDeg = h * 360f
+        val ranges = listOf(
+            0f to 30f to channels.red,
+            30f to 60f to channels.orange,
+            60f to 120f to channels.yellow,
+            120f to 180f to channels.green,
+            180f to 240f to channels.aqua,
+            240f to 300f to channels.blue,
+            300f to 360f to channels.purple
+        )
+        
+        if (hueDeg > 300f || hueDeg < 0f) {
+            val channel = channels.magenta
+            h = (h + channel.hue / 360f).coerceIn(0f, 1f)
+            s = (s + channel.saturation / 100f).coerceIn(0f, 1f)
+            l = (l + channel.luminance / 100f).coerceIn(0f, 1f)
+        }
+        
+        for ((range, channel) in ranges) {
+            if (hueDeg in range.first..range.second) {
+                val center = (range.first + range.second) / 2f
+                val weight = 1f - abs(hueDeg - center) / (range.second - range.first)
+                val softWeight = weight * weight
+                h = (h + channel.hue / 360f * softWeight).coerceIn(0f, 1f)
+                s = (s + channel.saturation / 100f * softWeight).coerceIn(0f, 1f)
+                l = (l + channel.luminance / 100f * softWeight).coerceIn(0f, 1f)
+                break
+            }
+        }
+        return Triple(h, s, l)
+    }
+    
+    private fun rgbToHsl(r: Float, g: Float, b: Float): Triple<Float, Float, Float> {
+        val max = maxOf(r, g, b)
+        val min = minOf(r, g, b)
+        val l = (max + min) / 2f
+        var h = 0f
+        var s = 0f
+        if (max != min) {
+            val d = max - min
+            s = if (l > 0.5f) d / (2f - max - min) else d / (max + min)
+            h = when (max) {
+                r -> ((g - b) / d + (if (g < b) 6f else 0f)) / 6f
+                g -> ((b - r) / d + 2f) / 6f
+                else -> ((r - g) / d + 4f) / 6f
+            }
+        }
+        return Triple(h, s, l)
+    }
+    
+    private fun hslToRgb(hsl: Triple<Float, Float, Float>): Triple<Float, Float, Float> {
+        val (h, s, l) = hsl
+        if (s == 0f) return Triple(l, l, l)
+        
+        fun hueToRgb(p: Float, q: Float, t: Float): Float {
+            var t2 = t
+            if (t2 < 0f) t2 += 1f
+            if (t2 > 1f) t2 -= 1f
+            return when {
+                t2 < 1f/6f -> p + (q - p) * 6f * t2
+                t2 < 1f/2f -> q
+                t2 < 2f/3f -> p + (q - p) * (2f/3f - t2) * 6f
+                else -> p
+            }
+        }
+        val q = if (l < 0.5f) l * (1f + s) else l + s - l * s
+        val p = 2f * l - q
+        return Triple(
+            hueToRgb(p, q, h + 1f/3f),
+            hueToRgb(p, q, h),
+            hueToRgb(p, q, h - 1f/3f)
+        )
+    }
+    
+    private fun applyEffects(bitmap: Bitmap, state: AdjustmentState): Bitmap {
+        var result = bitmap
+        if (state.clarity > 0f) result = applyClarity(result, state.clarity)
+        if (state.texture > 0f) result = applyTexture(result, state.texture)
+        if (state.dehaze > 0f) result = applyDehaze(result, state.dehaze)
+        if (state.sharpen > 0f) result = applySharpen(result, state.sharpen)
+        if (state.grain > 0f) result = applyGrain(result, state.grain)
+        if (state.vignette > 0f) result = applyVignette(result, state.vignette)
+        if (state.fade > 0f) result = applyFade(result, state.fade)
+        return result
+    }
+    
+    private fun applyClarity(bitmap: Bitmap, amount: Float): Bitmap {
+        return applyUnsharpMask(bitmap, amount * 2f, 20f)
+    }
+    
+    private fun applyTexture(bitmap: Bitmap, amount: Float): Bitmap {
+        return applyUnsharpMask(bitmap, amount * 1.5f, 5f)
+    }
+    
+    private fun applyUnsharpMask(bitmap: Bitmap, amount: Float, radius: Float): Bitmap {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val blurred = blurPixels(pixels, bitmap.width, bitmap.height, radius.toInt())
+        for (i in pixels.indices) {
+            val r = Color.red(pixels[i])
+            val g = Color.green(pixels[i])
+            val b = Color.blue(pixels[i])
+            val br = Color.red(blurred[i])
+            val bg = Color.green(blurred[i])
+            val bb = Color.blue(blurred[i])
+            pixels[i] = Color.rgb(
+                (r + (r - br) * amount).toInt().coerceIn(0, 255),
+                (g + (g - bg) * amount).toInt().coerceIn(0, 255),
+                (b + (b - bb) * amount).toInt().coerceIn(0, 255)
+            )
+        }
+        val result = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        bitmap.recycle()
+        return result
+    }
+    
+    private fun blurPixels(pixels: IntArray, width: Int, height: Int, radius: Int): IntArray {
+        val result = pixels.clone()
+        val kernel = FloatArray(radius * 2 + 1)
+        var sum = 0f
+        for (i in -radius..radius) {
+            val value = exp(-(i * i) / (2f * radius * radius))
+            kernel[i + radius] = value
+            sum += value
+        }
+        for (i in kernel.indices) kernel[i] /= sum
+        
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                var r = 0f; var g = 0f; var b = 0f
+                for (k in -radius..radius) {
+                    val xk = (x + k).coerceIn(0, width - 1)
+                    val idx = y * width + xk
+                    r += Color.red(pixels[idx]) * kernel[k + radius]
+                    g += Color.green(pixels[idx]) * kernel[k + radius]
+                    b += Color.blue(pixels[idx]) * kernel[k + radius]
+                }
+                val idx = y * width + x
+                result[idx] = Color.rgb(r.toInt().coerceIn(0, 255), g.toInt().coerceIn(0, 255), b.toInt().coerceIn(0, 255))
+            }
+        }
+        
+        for (x in 0 until width) {
+            for (y in 0 until height) {
+                var r = 0f; var g = 0f; var b = 0f
+                for (k in -radius..radius) {
+                    val yk = (y + k).coerceIn(0, height - 1)
+                    val idx = yk * width + x
+                    r += Color.red(result[idx]) * kernel[k + radius]
+                    g += Color.green(result[idx]) * kernel[k + radius]
+                    b += Color.blue(result[idx]) * kernel[k + radius]
+                }
+                val idx = y * width + x
+                result[idx] = Color.rgb(r.toInt().coerceIn(0, 255), g.toInt().coerceIn(0, 255), b.toInt().coerceIn(0, 255))
+            }
+        }
+        return result
+    }
+    
+    private fun applyDehaze(bitmap: Bitmap, amount: Float): Bitmap {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        for (i in pixels.indices) {
+            var r = Color.red(pixels[i])
+            var g = Color.green(pixels[i])
+            var b = Color.blue(pixels[i])
+            val haze = (r + g + b) / (3f * 255f)
+            val dehazeFactor = 1f - amount * haze
+            r = (r * dehazeFactor + 255f * amount * (1f - haze)).toInt().coerceIn(0, 255)
+            g = (g * dehazeFactor + 255f * amount * (1f - haze)).toInt().coerceIn(0, 255)
+            b = (b * dehazeFactor + 255f * amount * (1f - haze)).toInt().coerceIn(0, 255)
+            pixels[i] = Color.rgb(r, g, b)
+        }
+        val result = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        bitmap.recycle()
+        return result
+    }
+    
+    private fun applySharpen(bitmap: Bitmap, amount: Float): Bitmap {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val width = bitmap.width
+        val height = bitmap.height
+        for (y in 1 until height - 1) {
+            for (x in 1 until width - 1) {
+                val center = y * width + x
+                val r = Color.red(pixels[center])
+                val g = Color.green(pixels[center])
+                val b = Color.blue(pixels[center])
+                val neighborSum = 4 * r - (
+                    Color.red(pixels[(y - 1) * width + x]) +
+                    Color.red(pixels[(y + 1) * width + x]) +
+                    Color.red(pixels[y * width + x - 1]) +
+                    Color.red(pixels[y * width + x + 1])
+                )
+                pixels[center] = Color.rgb(
+                    (r + neighborSum * amount).toInt().coerceIn(0, 255),
+                    (g + neighborSum * amount).toInt().coerceIn(0, 255),
+                    (b + neighborSum * amount).toInt().coerceIn(0, 255)
+                )
+            }
+        }
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, width, 0, 0, width, height)
+        bitmap.recycle()
+        return result
+    }
+    
+    private fun applyGrain(bitmap: Bitmap, amount: Float): Bitmap {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        for (i in pixels.indices) {
+            val noise = (Math.random() * 2 - 1).toFloat() * amount * 30f
+            pixels[i] = Color.rgb(
+                (Color.red(pixels[i]) + noise).toInt().coerceIn(0, 255),
+                (Color.green(pixels[i]) + noise).toInt().coerceIn(0, 255),
+                (Color.blue(pixels[i]) + noise).toInt().coerceIn(0, 255)
+            )
+        }
+        val result = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        bitmap.recycle()
+        return result
+    }
+    
+    private fun applyVignette(bitmap: Bitmap, amount: Float): Bitmap {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val width = bitmap.width
+        val height = bitmap.height
+        val centerX = width / 2f
+        val centerY = height / 2f
+        val maxDist = sqrt(centerX * centerX + centerY * centerY)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val dx = x - centerX
+                val dy = y - centerY
+                val dist = sqrt(dx * dx + dy * dy)
+                val factor = 1f - amount * (dist / maxDist) * (dist / maxDist)
+                val idx = y * width + x
+                pixels[idx] = Color.rgb(
+                    (Color.red(pixels[idx]) * factor).toInt().coerceIn(0, 255),
+                    (Color.green(pixels[idx]) * factor).toInt().coerceIn(0, 255),
+                    (Color.blue(pixels[idx]) * factor).toInt().coerceIn(0, 255)
+                )
+            }
+        }
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, width, 0, 0, width, height)
+        bitmap.recycle()
+        return result
+    }
+    
+    private fun applyFade(bitmap: Bitmap, amount: Float): Bitmap {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val fadeValue = (amount * 255f).toInt()
+        for (i in pixels.indices) {
+            pixels[i] = Color.rgb(
+                (Color.red(pixels[i]) + fadeValue).coerceIn(0, 255),
+                (Color.green(pixels[i]) + fadeValue).coerceIn(0, 255),
+                (Color.blue(pixels[i]) + fadeValue).coerceIn(0, 255)
+            )
+        }
+        val result = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        bitmap.recycle()
+        return result
+    }
+    
+    suspend fun autoEnhance(bitmap: Bitmap): AdjustmentState = withContext(Dispatchers.Default) {
+        val pixels = IntArray(minOf(10000, bitmap.width * bitmap.height))
+        val sampleWidth = minOf(100, bitmap.width)
+        val sampleHeight = minOf(100, bitmap.height)
+        bitmap.getPixels(pixels, 0, sampleWidth, 0, 0, sampleWidth, sampleHeight)
+        
+        var sumR = 0f; var sumG = 0f; var sumB = 0f
+        var minL = 1f; var maxL = 0f
+        
+        for (pixel in pixels) {
+            val r = Color.red(pixel) / 255f
+            val g = Color.green(pixel) / 255f
+            val b = Color.blue(pixel) / 255f
+            val l = 0.299f * r + 0.587f * g + 0.114f * b
+            sumR += r; sumG += g; sumB += b
+            minL = min(minL, l)
+            maxL = max(maxL, l)
+        }
+        
+        val avgR = sumR / pixels.size
+        val avgG = sumG / pixels.size
+        val avgB = sumB / pixels.size
+        val avgL = 0.299f * avgR + 0.587f * avgG + 0.114f * avgB
+        
+        AdjustmentState().apply {
+            contrast = (0.5f - avgL) * 0.5f
+            exposure = (0.5f - avgL) * 0.8f
+            temperature = (0.5f - avgR) * 0.3f
+            vibrance = (0.5f - (avgR + avgG + avgB) / 3f) * 0.5f
+            highlights = (1f - maxL) * 0.3f
+            shadows = minL * 0.3f
+        }
+    }
 }
